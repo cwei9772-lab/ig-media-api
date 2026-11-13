@@ -282,40 +282,56 @@ async function fetchMediaInfo(shortcode) {
     info.note = 'shortcode 非法';
     return info;
   }
-  let res;
-  try {
-    res = await fetchWithRetry(IG + '/api/v1/media/' + id + '/info/', {
-      timeout: TIMEOUT,
-      retries: 0,
-      headers: {
-        'x-ig-app-id': '936619743392459',
-        Accept: '*/*',
-        Referer: IG + '/p/' + shortcode + '/',
-        'Sec-Fetch-Site': 'same-origin',
-        'Sec-Fetch-Mode': 'cors',
-        'User-Agent':
-          'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'
-      }
-    });
-  } catch (e) {
-    info.note = e.message;
-    return info;
+
+  const targets = [
+    { url: IG + '/api/v1/media/' + id + '/info/', appId: '936619743392459', android: false },
+    { url: IG + '/api/v1/media/' + id + '/info/', appId: '1217981644879628', android: false },
+    { url: 'https://i.instagram.com/api/v1/media/' + id + '/info/', appId: '567067343352427', android: true }
+  ];
+
+  const notes = [];
+  let json = null;
+  for (const t of targets) {
+    let res;
+    try {
+      res = await fetchWithRetry(t.url, {
+        timeout: TIMEOUT,
+        retries: 0,
+        headers: {
+          'x-ig-app-id': t.appId,
+          Accept: '*/*',
+          Referer: IG + '/p/' + shortcode + '/',
+          'Sec-Fetch-Site': 'same-origin',
+          'Sec-Fetch-Mode': 'cors',
+          'User-Agent': t.android
+            ? 'Instagram 219.0.0.12.117 Android (26/8.0.0; 480dpi; 1080x1920; samsung; SM-G950F; dreamlte; samsungexynos8895; en_US)'
+            : 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'
+        }
+      });
+    } catch (e) {
+      notes.push(t.appId + ':err(' + e.message + ')');
+      continue;
+    }
+    info.status = res.statusCode;
+    notes.push(t.appId + ':' + res.statusCode);
+    if (res.statusCode !== 200) {
+      if (res.statusCode === 429) await new Promise((r) => setTimeout(r, 1500));
+      continue;
+    }
+    try {
+      json = JSON.parse(res.body.toString('utf8'));
+    } catch (e) {
+      notes.push(t.appId + ':非JSON');
+      continue;
+    }
+    break;
   }
-  info.status = res.statusCode;
-  if (res.statusCode !== 200) {
-    info.note = 'HTTP ' + res.statusCode;
-    return info;
-  }
-  let json;
-  try {
-    json = JSON.parse(res.body.toString('utf8'));
-  } catch (e) {
-    info.note = '返回不是 JSON';
-    return info;
-  }
+  info.note = notes.join(' | ');
+  if (!json) return info;
+
   const item = (json.items || [])[0];
   if (!item) {
-    info.note = 'items 为空';
+    info.note += ' items为空';
     return info;
   }
 
@@ -332,8 +348,31 @@ async function fetchMediaInfo(shortcode) {
   info.author = (item.user && item.user.username) || '';
   info.caption = (item.caption && item.caption.text) || '';
   info.ok = info.items.length > 0;
-  if (!info.ok) info.note = '没有可用媒体';
+  if (!info.ok) info.note += ' 没有可用媒体';
   return info;
+}
+
+// 备用路子：带上 img_index 请求帖子页，看 og:image 是否按序号变化（能变就说明每张都有独立封面）
+async function fetchOgByIndex(shortcode, kind, maxIndex) {
+  const found = [];
+  const max = maxIndex || 10;
+  for (let i = 1; i <= max; i++) {
+    try {
+      const res = await fetchWithRetry(IG + '/' + kind + '/' + shortcode + '/?img_index=' + i, {
+        timeout: TIMEOUT,
+        retries: 0,
+        headers: POST_HEADERS
+      });
+      if (res.statusCode !== 200) continue;
+      const og = res.body.toString('utf8').match(/<meta[^>]+property="og:image"[^>]+content="([^"]+)"/i);
+      if (!og) continue;
+      const u = decodeEntities(og[1]);
+      if (u && !found.includes(u)) found.push(u);
+    } catch (e) {
+      continue;
+    }
+  }
+  return found;
 }
 
 const cache = new Map();
@@ -635,6 +674,25 @@ const server = http.createServer(async (req, res) => {
 
     if (path === '/api/demo') {
       return sendJson(res, 200, { ok: true, data: DEMO });
+    }
+
+    if (path === '/api/debug') {
+      const raw = q.get('sc') || q.get('url') || '';
+      const t = extractTarget(raw);
+      if (!t) return sendJson(res, 400, { ok: false, error: '缺少 sc 参数' });
+      const mi = await fetchMediaInfo(t.shortcode);
+      const ogs = await fetchOgByIndex(t.shortcode, t.kind, 10);
+      return sendJson(res, 200, {
+        ok: true,
+        shortcode: t.shortcode,
+        apiStatus: mi.status,
+        apiNote: mi.note,
+        apiCount: mi.items.length,
+        apiItems: mi.items.slice(0, 3).map((x) => ({ type: x.type, w: x.width, h: x.height, url: x.url.slice(0, 90) })),
+        ogCount: ogs.length,
+        ogItems: ogs.map((u) => u.slice(0, 90)),
+        mediaId: mediaIdFromShortcode(t.shortcode)
+      });
     }
 
     if (path === '/api/parse') {
