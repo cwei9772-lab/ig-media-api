@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: ig-media-api
+    runtime: node
+    plan: free
+    region: singapore
+    buildCommand: npm install --no-audit --no-fund
+    startCommand: node index.js
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: IG_TIMEOUT
+        value: "15000"
+      # 想防止别人蹭接口就设一个口令，然后小程序里带上 ?t=口令
+      # - key: API_TOKEN
+      #   sync: false
