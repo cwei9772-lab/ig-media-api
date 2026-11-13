@@ -1,0 +1,14 @@
+{
+  "name": "ig-media-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Instagram 公开帖子解析 + 图片中转 API（零依赖，可直接部署到 Render）",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "selftest": "node index.js --selftest"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
