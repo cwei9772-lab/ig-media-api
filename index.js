@@ -20,7 +20,7 @@ const { URL } = require('url');
 
 const PORT = Number(process.env.PORT || 3000);
 const HOST = '0.0.0.0';
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';
 const START_AT = Date.now();
 const TIMEOUT = Number(process.env.IG_TIMEOUT || 15000);
 const RETRIES = Number(process.env.IG_RETRIES || 1);
@@ -257,6 +257,85 @@ function isConnError(e) {
   );
 }
 
+/* ------------------------------------------------ 轮播补全：走媒体详情接口拿全部子项 */
+const SHORTCODE_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+
+function mediaIdFromShortcode(sc) {
+  let id = BigInt(0);
+  for (const ch of String(sc)) {
+    const idx = SHORTCODE_ALPHABET.indexOf(ch);
+    if (idx < 0) return '';
+    id = id * BigInt(64) + BigInt(idx);
+  }
+  return id.toString();
+}
+
+function firstImageUrl(versions) {
+  const cands = (versions && versions.candidates) || [];
+  return cands.length ? cands[0].url : '';
+}
+
+async function fetchMediaInfo(shortcode) {
+  const info = { status: 0, ok: false, note: '', items: [], author: '', caption: '' };
+  const id = mediaIdFromShortcode(shortcode);
+  if (!id) {
+    info.note = 'shortcode 非法';
+    return info;
+  }
+  let res;
+  try {
+    res = await fetchWithRetry(IG + '/api/v1/media/' + id + '/info/', {
+      timeout: TIMEOUT,
+      retries: 0,
+      headers: {
+        'x-ig-app-id': '936619743392459',
+        Accept: '*/*',
+        Referer: IG + '/p/' + shortcode + '/',
+        'Sec-Fetch-Site': 'same-origin',
+        'Sec-Fetch-Mode': 'cors',
+        'User-Agent':
+          'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'
+      }
+    });
+  } catch (e) {
+    info.note = e.message;
+    return info;
+  }
+  info.status = res.statusCode;
+  if (res.statusCode !== 200) {
+    info.note = 'HTTP ' + res.statusCode;
+    return info;
+  }
+  let json;
+  try {
+    json = JSON.parse(res.body.toString('utf8'));
+  } catch (e) {
+    info.note = '返回不是 JSON';
+    return info;
+  }
+  const item = (json.items || [])[0];
+  if (!item) {
+    info.note = 'items 为空';
+    return info;
+  }
+
+  const children = Array.isArray(item.carousel_media) && item.carousel_media.length ? item.carousel_media : [item];
+  for (const c of children) {
+    const img = firstImageUrl(c.image_versions2);
+    const vid = Array.isArray(c.video_versions) && c.video_versions.length ? c.video_versions[0].url : '';
+    if (vid) {
+      info.items.push({ type: 'video', url: img || vid, width: c.width || 0, height: c.height || 0, thumb: img, video: vid });
+    } else if (img) {
+      info.items.push({ type: 'image', url: img, width: c.width || 0, height: c.height || 0, thumb: img, video: '' });
+    }
+  }
+  info.author = (item.user && item.user.username) || '';
+  info.caption = (item.caption && item.caption.text) || '';
+  info.ok = info.items.length > 0;
+  if (!info.ok) info.note = '没有可用媒体';
+  return info;
+}
+
 const cache = new Map();
 function cacheGet(k) {
   const hit = cache.get(k);
@@ -291,6 +370,7 @@ async function parse(input) {
   let lastErr = null;
   let htmlSeen = '';
   let connFail = false;
+  let parsedOk = null;
 
   for (const att of attempts) {
     try {
@@ -313,8 +393,8 @@ async function parse(input) {
       const parsed = parseHtml(html, target);
       parsed.source = att.name;
       if (parsed.items.length) {
-        cacheSet('p:' + target.shortcode, parsed);
-        return parsed;
+        parsedOk = parsed;
+        break;
       }
       lastErr = new Error(att.name + ' 页面里没有解析到媒体');
     } catch (e) {
@@ -325,6 +405,38 @@ async function parse(input) {
         break;
       }
     }
+  }
+
+  // 轮播帖（/p/xxxx?img_index=4 这类）embed 页只给第一张，用媒体详情接口补齐全部子项
+  if (parsedOk && parsedOk.items.length <= 1) {
+    const mi = await fetchMediaInfo(target.shortcode);
+    parsedOk.meta = { apiStatus: mi.status, apiNote: mi.note, apiCount: mi.items.length };
+    if (mi.ok && mi.items.length > parsedOk.items.length) {
+      parsedOk.items = mi.items;
+      parsedOk.source = 'api';
+      if (mi.author) parsedOk.author = mi.author;
+      if (mi.caption) parsedOk.caption = mi.caption;
+    }
+  } else if (!parsedOk) {
+    // embed / 页面都失败时，再试一次媒体详情接口
+    const mi = await fetchMediaInfo(target.shortcode);
+    if (mi.ok) {
+      parsedOk = {
+        shortcode: target.shortcode,
+        url: target.url,
+        kind: target.kind,
+        author: mi.author,
+        caption: mi.caption,
+        items: mi.items,
+        source: 'api',
+        meta: { apiStatus: mi.status, apiNote: mi.note, apiCount: mi.items.length }
+      };
+    }
+  }
+
+  if (parsedOk) {
+    cacheSet('p:' + target.shortcode, parsedOk);
+    return parsedOk;
   }
 
   if (connFail) {
