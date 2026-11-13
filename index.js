@@ -27,6 +27,24 @@ const RETRIES = Number(process.env.IG_RETRIES || 1);
 // 可选：设置 API_TOKEN 后，调用需带 ?t=xxx 或 x-api-token 头，防止别人蹭你的中转
 const API_TOKEN = (process.env.API_TOKEN || '').trim();
 
+/* 可选：带登录态（从环境变量读，代码里不写任何凭据值）
+ * 只在“公开页面拿不到轮播图”时用；不设这些变量就完全按匿名模式跑。
+ *   IG_SESSIONID   必填，Instagram 的 sessionid
+ *   IG_CSRFTOKEN   可选，csrftoken
+ *   IG_DS_USER_ID  可选，ds_user_id
+ */
+function buildIGCookie() {
+  const sid = (process.env.IG_SESSIONID || '').trim();
+  if (!sid) return { header: '', csrf: '', label: 'off' };
+  const csrf = (process.env.IG_CSRFTOKEN || '').trim();
+  const uid = (process.env.IG_DS_USER_ID || '').trim();
+  const parts = ['sessionid=' + sid];
+  if (csrf) parts.push('csrftoken=' + csrf);
+  if (uid) parts.push('ds_user_id=' + uid);
+  return { header: parts.join('; '), csrf, label: 'on(' + parts.length + ')' };
+}
+const IG_COOKIE = buildIGCookie();
+
 const ALLOWED_HOSTS = [
   'cdninstagram.com',
   'instagram.com',
@@ -297,14 +315,19 @@ async function fetchPostGraphQL(shortcode) {
       body: body,
       timeout: TIMEOUT,
       retries: 0,
-      headers: {
-        'content-type': 'application/x-www-form-urlencoded',
-        'x-ig-app-id': '936619743392459',
-        'x-fb-friendly-name': 'PolarisPostActionLoadPostQueryQuery',
-        origin: IG,
-        referer: IG + '/p/' + shortcode + '/',
-        Accept: '*/*'
-      }
+      headers: Object.assign(
+        {
+          'content-type': 'application/x-www-form-urlencoded',
+          'x-ig-app-id': '936619743392459',
+          'x-fb-friendly-name': 'PolarisPostActionLoadPostQueryQuery',
+          origin: IG,
+          referer: IG + '/p/' + shortcode + '/',
+          Accept: '*/*'
+        },
+        IG_COOKIE.header
+          ? { Cookie: IG_COOKIE.header, 'x-csrftoken': IG_COOKIE.csrf || 'missing', 'x-ig-www-claim': '0' }
+          : {}
+      )
     });
   } catch (e) {
     info.note = 'err(' + e.message + ')';
@@ -412,16 +435,19 @@ async function fetchMediaInfo(shortcode) {
       res = await fetchWithRetry(t.url, {
         timeout: TIMEOUT,
         retries: 0,
-        headers: {
-          'x-ig-app-id': t.appId,
-          Accept: '*/*',
-          Referer: IG + '/p/' + shortcode + '/',
-          'Sec-Fetch-Site': 'same-origin',
-          'Sec-Fetch-Mode': 'cors',
-          'User-Agent': t.android
-            ? 'Instagram 219.0.0.12.117 Android (26/8.0.0; 480dpi; 1080x1920; samsung; SM-G950F; dreamlte; samsungexynos8895; en_US)'
-            : 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'
-        }
+        headers: Object.assign(
+          {
+            'x-ig-app-id': t.appId,
+            Accept: '*/*',
+            Referer: IG + '/p/' + shortcode + '/',
+            'Sec-Fetch-Site': 'same-origin',
+            'Sec-Fetch-Mode': 'cors',
+            'User-Agent': t.android
+              ? 'Instagram 219.0.0.12.117 Android (26/8.0.0; 480dpi; 1080x1920; samsung; SM-G950F; dreamlte; samsungexynos8895; en_US)'
+              : 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'
+          },
+          IG_COOKIE.header ? { Cookie: IG_COOKIE.header } : {}
+        )
       });
     } catch (e) {
       notes.push(t.appId + ':err(' + e.message + ')');
@@ -781,7 +807,8 @@ const server = http.createServer(async (req, res) => {
         version: VERSION,
         uptimeSec: Math.round((Date.now() - START_AT) / 1000),
         region: process.env.RENDER_REGION || 'unknown',
-        cacheEntries: cache.size
+        cacheEntries: cache.size,
+        cookieMode: IG_COOKIE.label
       });
     }
 
@@ -803,6 +830,7 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, {
         ok: true,
         shortcode: t.shortcode,
+        cookieMode: IG_COOKIE.label,
         gqlStatus: mi.gqlStatus,
         gqlNote: mi.gqlNote,
         apiStatus: mi.status,
