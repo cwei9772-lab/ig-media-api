@@ -366,6 +366,10 @@ async function fetchPostGraphQL(shortcode) {
 
 async function fetchMediaInfo(shortcode) {
   const info = { status: 0, ok: false, note: '', items: [], author: '', caption: '' };
+  if (Date.now() < fullPostBlockedUntil) {
+    info.note = '冷却中（此前被 IG 拒绝，跳过轮播补全）';
+    return info;
+  }
   const id = mediaIdFromShortcode(shortcode);
   if (!id) {
     info.note = 'shortcode 非法';
@@ -389,6 +393,14 @@ async function fetchMediaInfo(shortcode) {
     info.status = gql.status;
     info.note = 'graphql:' + gql.status;
     info.ok = info.items.length > 0;
+    return info;
+  }
+  // 403/429 说明这个出口 IP 被 IG 拒了，后面两个接口同样会被拒，直接冷却 10 分钟，
+  // 免得每个帖子都白等好几秒
+  if (gql.status === 403 || gql.status === 429) {
+    fullPostBlockedUntil = Date.now() + FULLPOST_COOLDOWN;
+    info.status = gql.status;
+    info.note = 'graphql:' + gql.status + '（IP 被拒，' + Math.round(FULLPOST_COOLDOWN / 60000) + ' 分钟内不再尝试）';
     return info;
   }
 
@@ -479,6 +491,9 @@ async function fetchOgByIndex(shortcode, kind, maxIndex) {
 }
 
 const cache = new Map();
+// 轮播补全用的“带鉴权接口”一旦被 IG 拒（403/429），冷却一段时间不再尝试
+const FULLPOST_COOLDOWN = 10 * 60 * 1000;
+let fullPostBlockedUntil = 0;
 function cacheGet(k) {
   const hit = cache.get(k);
   if (!hit) return null;
