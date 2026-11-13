@@ -58,6 +58,8 @@ function decompress(buf, enc) {
 function requestOnce(target, opts) {
   const u = new URL(target);
   const timeout = opts.timeout || TIMEOUT;
+  const method = opts.method || 'GET';
+  const body = opts.body || null;
   const headers = Object.assign(
     {
       'User-Agent': opts.userAgent || pickUA(),
@@ -68,6 +70,7 @@ function requestOnce(target, opts) {
     },
     opts.headers || {}
   );
+  if (body) headers['Content-Length'] = Buffer.byteLength(body);
 
   return new Promise((resolve, reject) => {
     const mod = u.protocol === 'https:' ? https : http;
@@ -76,7 +79,7 @@ function requestOnce(target, opts) {
         host: u.hostname,
         port: Number(u.port || (u.protocol === 'https:' ? 443 : 80)),
         path: u.pathname + u.search,
-        method: 'GET',
+        method,
         headers,
         timeout
       },
@@ -103,6 +106,7 @@ function requestOnce(target, opts) {
     );
     req.on('error', reject);
     req.on('timeout', () => req.destroy(new Error('请求超时（' + timeout + 'ms）')));
+    if (body) req.write(body);
     req.end();
   });
 }
@@ -275,6 +279,91 @@ function firstImageUrl(versions) {
   return cands.length ? cands[0].url : '';
 }
 
+async function fetchPostGraphQL(shortcode) {
+  const info = { status: 0, note: '', ok: false, items: [], author: '', caption: '' };
+  const vars = {
+    shortcode: shortcode,
+    first: 50,
+    after: null,
+    last: null,
+    before: null,
+    data: { comment_count: 0, include_reel_media_seen_timestamp: true }
+  };
+  const body = 'doc_id=8845758582119845&variables=' + encodeURIComponent(JSON.stringify(vars));
+  let res;
+  try {
+    res = await fetchWithRetry(IG + '/graphql/query', {
+      method: 'POST',
+      body: body,
+      timeout: TIMEOUT,
+      retries: 0,
+      headers: {
+        'content-type': 'application/x-www-form-urlencoded',
+        'x-ig-app-id': '936619743392459',
+        'x-fb-friendly-name': 'PolarisPostActionLoadPostQueryQuery',
+        origin: IG,
+        referer: IG + '/p/' + shortcode + '/',
+        Accept: '*/*'
+      }
+    });
+  } catch (e) {
+    info.note = 'err(' + e.message + ')';
+    return info;
+  }
+  info.status = res.statusCode;
+  if (res.statusCode !== 200) {
+    info.note = 'HTTP ' + res.statusCode;
+    return info;
+  }
+  let json;
+  try {
+    json = JSON.parse(res.body.toString('utf8'));
+  } catch (e) {
+    info.note = '非JSON';
+    return info;
+  }
+  const m = (json.data && (json.data.xdt_shortcode_media || json.data.shortcode_media)) || null;
+  if (!m) {
+    info.note = 'lack_media';
+    return info;
+  }
+  const edges = m.edge_sidecar_to_children && m.edge_sidecar_to_children.edges;
+  const nodes = edges && edges.length ? edges.map((e) => e.node) : [m];
+  for (const nd of nodes) {
+    if (!nd) continue;
+    const dim = nd.dimensions || {};
+    if (nd.is_video && nd.video_url) {
+      info.items.push({
+        type: 'video',
+        url: nd.display_url || nd.video_url,
+        width: dim.width || 0,
+        height: dim.height || 0,
+        thumb: nd.display_url || '',
+        video: nd.video_url
+      });
+    } else if (nd.display_url) {
+      info.items.push({
+        type: 'image',
+        url: nd.display_url,
+        width: dim.width || 0,
+        height: dim.height || 0,
+        thumb: nd.display_url,
+        video: ''
+      });
+    }
+  }
+  info.author = (m.owner && m.owner.username) || '';
+  info.caption =
+    (m.edge_media_to_caption &&
+      m.edge_media_to_caption.edges &&
+      m.edge_media_to_caption.edges[0] &&
+      m.edge_media_to_caption.edges[0].node.text) ||
+    '';
+  info.ok = info.items.length > 0;
+  if (!info.ok) info.note = '没有媒体';
+  return info;
+}
+
 async function fetchMediaInfo(shortcode) {
   const info = { status: 0, ok: false, note: '', items: [], author: '', caption: '' };
   const id = mediaIdFromShortcode(shortcode);
@@ -288,6 +377,20 @@ async function fetchMediaInfo(shortcode) {
     { url: IG + '/api/v1/media/' + id + '/info/', appId: '1217981644879628', android: false },
     { url: 'https://i.instagram.com/api/v1/media/' + id + '/info/', appId: '567067343352427', android: true }
   ];
+
+  // 先走 GraphQL（轮播帖最完整的来源），失败再退回 api/v1
+  const gql = await fetchPostGraphQL(shortcode);
+  info.gqlStatus = gql.status;
+  info.gqlNote = gql.note;
+  if (gql.ok) {
+    info.items = gql.items;
+    info.author = gql.author;
+    info.caption = gql.caption;
+    info.status = gql.status;
+    info.note = 'graphql:' + gql.status;
+    info.ok = info.items.length > 0;
+    return info;
+  }
 
   const notes = [];
   let json = null;
@@ -685,6 +788,8 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, {
         ok: true,
         shortcode: t.shortcode,
+        gqlStatus: mi.gqlStatus,
+        gqlNote: mi.gqlNote,
         apiStatus: mi.status,
         apiNote: mi.note,
         apiCount: mi.items.length,
